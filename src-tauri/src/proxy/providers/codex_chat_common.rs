@@ -167,6 +167,42 @@ pub(crate) fn tool_call_extra_content(source: &Value) -> Option<&Value> {
         .filter(|value| value.as_object().is_some_and(|obj| !obj.is_empty()))
 }
 
+pub(crate) fn message_thinking_signature(source: &Value) -> Option<&str> {
+    source
+        .get("thinking_signature")
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
+}
+
+pub(crate) fn copy_message_thinking_signature(target: &mut Value, source: &Value) {
+    if let Some(signature) = message_thinking_signature(source) {
+        target["thinking_signature"] = json!(signature);
+    }
+}
+
+pub(crate) fn restore_message_thinking_signature(message: &mut Value) {
+    let mut signature = message_thinking_signature(message).map(str::to_string);
+    if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+        for call in calls {
+            if let Some(value) = call
+                .as_object_mut()
+                .and_then(|call| call.remove("thinking_signature"))
+            {
+                if signature.is_none() {
+                    signature = value
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+                }
+            }
+        }
+    }
+    // Responses separates a message into call items; AIGW expects its signature back on the message.
+    if let Some(signature) = signature {
+        message["thinking_signature"] = json!(signature);
+    }
+}
+
 /// Gemini 文档给的跳过签名校验的占位值，只在真签名找不回来时兜底用（会影响模型表现）。
 const GEMINI_SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
@@ -191,6 +227,9 @@ pub(crate) fn fill_gemini_thought_signature_fallback(chat_body: &mut Value) -> u
     let mut filled = 0;
     for message in &mut messages[turn_start..] {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if message_thinking_signature(message).is_some() {
             continue;
         }
         let Some(first_call) = message

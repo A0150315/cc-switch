@@ -483,6 +483,7 @@ fn enrich_call_item_from_cache(item: &mut Value, cached: &Value) -> bool {
         "reasoning_content",
         "reasoning",
         "extra_content",
+        "thinking_signature",
     ] {
         if item.get(key).is_some_and(|value| !is_empty_value(value)) {
             continue;
@@ -746,6 +747,90 @@ mod tests {
             .find(|message| message["role"] == "assistant")
             .unwrap();
         assert_eq!(assistant["tool_calls"][0]["extra_content"], signature);
+    }
+
+    #[tokio::test]
+    async fn round_trips_aigw_message_signature_without_reasoning() {
+        let signature = "AY89a1+V8p0S54a50da2F8G8Jd+ohCOgglNUB/PMsh3HwSW+pnxOtdcVinsDm1zoQSSO4zi+yeqf/L9UfdtEalw1YvEN4qii9S6iXGVaaA6ekV3Whw==";
+        let response =
+            super::super::transform_codex_chat::chat_completion_to_response(serde_json::json!({
+                "id": "chatcmpl_aigw",
+                "model": "gemini-4-argon",
+                "choices": [{"finish_reason": "stop", "message": {
+                    "role": "assistant", "content": "",
+                    "thinking_signature": signature,
+                    "tool_calls": [{"id": "call_aigw", "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Beijing\"}"}}]
+                }}]
+            }))
+            .unwrap();
+        assert_eq!(response["output"][0]["thinking_signature"], signature);
+        let history = CodexChatHistoryStore::default();
+        history.record_response(&response).await;
+        for include_call in [false, true] {
+            let mut input = vec![serde_json::json!({"role": "user", "content": "weather"})];
+            if include_call {
+                input.push(
+                    serde_json::json!({"type": "function_call", "call_id": "call_aigw",
+                    "name": "get_weather", "arguments": "{\"city\":\"Beijing\"}"}),
+                );
+            }
+            input.push(serde_json::json!({"type": "function_call_output",
+                "call_id": "call_aigw", "output": "sunny"}));
+            let mut request = serde_json::json!({"model": "gemini-4-argon", "input": input});
+            assert_eq!(history.enrich_request(&mut request).await, 1);
+            let mut chat =
+                super::super::transform_codex_chat::responses_to_chat_completions(request).unwrap();
+            assert_eq!(
+                super::super::codex_chat_common::fill_gemini_thought_signature_fallback(&mut chat),
+                0
+            );
+            let assistant = &chat["messages"][1];
+            assert_eq!(assistant["thinking_signature"], signature);
+            assert!(assistant.get("reasoning_content").is_none());
+            assert!(assistant["tool_calls"][0]
+                .get("thinking_signature")
+                .is_none());
+            assert!(assistant["tool_calls"][0].get("extra_content").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn aigw_signatures_stay_with_sequential_and_parallel_call_groups() {
+        let history = CodexChatHistoryStore::default();
+        for (response_id, signature, calls) in [
+            ("resp_old", "sig-old", vec!["call_old"]),
+            ("resp_new", "sig-new", vec!["call_new_1", "call_new_2"]),
+        ] {
+            let response = super::super::transform_codex_chat::chat_completion_to_response(json!({
+                "id": response_id, "choices": [{"message": {
+                    "role": "assistant", "thinking_signature": signature,
+                    "tool_calls": calls.iter().map(|id| json!({"id": id, "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{}"}})).collect::<Vec<_>>()
+                }}]
+            })).unwrap();
+            history.record_response(&response).await;
+        }
+        let mut request = json!({"input": [
+            {"role": "user", "content": "test"},
+            {"type": "function_call", "call_id": "call_old", "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_old", "output": "old"},
+            {"type": "function_call_output", "call_id": "call_new_1", "output": "one"},
+            {"type": "function_call_output", "call_id": "call_new_2", "output": "two"}
+        ]});
+        history.enrich_request(&mut request).await;
+        let chat =
+            super::super::transform_codex_chat::responses_to_chat_completions(request).unwrap();
+        let assistants: Vec<_> = chat["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants[0]["thinking_signature"], "sig-old");
+        assert_eq!(assistants[1]["thinking_signature"], "sig-new");
+        assert_eq!(assistants[1]["tool_calls"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

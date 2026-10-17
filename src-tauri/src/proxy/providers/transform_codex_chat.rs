@@ -5,9 +5,10 @@
 //! OpenAI-compatible Chat Completions endpoint.
 
 use super::codex_chat_common::{
-    append_reasoning_content, copy_tool_call_extra_content, extract_reasoning_field_text,
-    extract_reasoning_summary_text, response_function_call_item,
-    response_function_call_item_with_namespace,
+    append_reasoning_content, copy_message_thinking_signature, copy_tool_call_extra_content,
+    extract_reasoning_field_text, extract_reasoning_summary_text, message_thinking_signature,
+    response_function_call_item, response_function_call_item_with_namespace,
+    restore_message_thinking_signature,
 };
 use super::codex_compaction;
 use super::inline_think::split_leading_think_block;
@@ -831,6 +832,7 @@ fn append_responses_item_as_chat_message(
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
             let mut tool_call = responses_function_call_to_chat_tool_call(item, tool_context);
             copy_tool_call_extra_content(&mut tool_call, item);
+            copy_message_thinking_signature(&mut tool_call, item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
@@ -838,6 +840,7 @@ fn append_responses_item_as_chat_message(
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
             let mut tool_call = responses_custom_tool_call_to_chat_tool_call(item);
             copy_tool_call_extra_content(&mut tool_call, item);
+            copy_message_thinking_signature(&mut tool_call, item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
@@ -845,6 +848,7 @@ fn append_responses_item_as_chat_message(
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
             let mut tool_call = responses_tool_search_call_to_chat_tool_call(item);
             copy_tool_call_extra_content(&mut tool_call, item);
+            copy_message_thinking_signature(&mut tool_call, item);
             register_known_tool_call_id(known_tool_call_ids, &tool_call);
             pending_tool_calls.push(tool_call);
         }
@@ -1287,6 +1291,7 @@ fn flush_pending_tool_calls(
         "content": null,
         "tool_calls": std::mem::take(pending_tool_calls)
     });
+    restore_message_thinking_signature(&mut message);
     attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
     *last_assistant_index = Some(messages.len());
     messages.push(message);
@@ -1322,6 +1327,7 @@ fn merge_pending_tool_calls_into_adjacent_assistant(
         "tool_calls".to_string(),
         Value::Array(std::mem::take(pending_tool_calls)),
     );
+    restore_message_thinking_signature(message);
     attach_pending_reasoning_to_assistant_unique(message, pending_reasoning);
     Some(index)
 }
@@ -1387,6 +1393,7 @@ fn responses_message_item_to_chat_message(
     });
 
     if chat_role == "assistant" {
+        copy_message_thinking_signature(&mut message, item);
         append_pending_reasoning(pending_reasoning, responses_message_reasoning_text(item));
         attach_pending_reasoning_to_assistant(&mut message, pending_reasoning);
     } else {
@@ -1501,7 +1508,7 @@ fn backfill_tool_call_reasoning_placeholders(messages: &mut [Value]) {
                 .get("tool_calls")
                 .and_then(|value| value.as_array())
                 .is_some_and(|calls| !calls.is_empty());
-        if is_assistant_tool_call {
+        if is_assistant_tool_call && message_thinking_signature(message).is_none() {
             ensure_tool_call_reasoning_content(message);
         }
     }
@@ -2129,12 +2136,10 @@ fn chat_tool_calls_to_response_output_items(
                 );
                 continue;
             }
-            output.push(chat_tool_call_to_response_item(
-                tool_call,
-                index,
-                reasoning,
-                tool_context,
-            ));
+            let mut item =
+                chat_tool_call_to_response_item(tool_call, index, reasoning, tool_context);
+            copy_message_thinking_signature(&mut item, message);
+            output.push(item);
         }
     } else if let Some(function_call) = message.get("function_call") {
         match chat_legacy_function_call_to_response_item(function_call, reasoning, tool_context) {

@@ -2,7 +2,9 @@
 
 use super::codex_responses_sse as sse;
 use super::{
-    codex_chat_common::{extract_reasoning_field_text, tool_call_extra_content},
+    codex_chat_common::{
+        extract_reasoning_field_text, message_thinking_signature, tool_call_extra_content,
+    },
     codex_compaction,
     inline_think::InlineThinkSplitter,
     transform_codex_chat::{
@@ -53,6 +55,7 @@ struct ToolCallState {
 
 #[derive(Debug)]
 struct ChatToResponsesState {
+    thinking_signature: Option<String>,
     response_started: bool,
     completed: bool,
     response_id: String,
@@ -75,6 +78,7 @@ struct ChatToResponsesState {
 impl Default for ChatToResponsesState {
     fn default() -> Self {
         Self {
+            thinking_signature: None,
             response_started: false,
             completed: false,
             response_id: "resp_ccswitch".to_string(),
@@ -133,6 +137,9 @@ impl ChatToResponsesState {
         };
 
         if let Some(delta) = choice.get("delta") {
+            if let Some(signature) = message_thinking_signature(delta) {
+                self.thinking_signature = Some(signature.to_string());
+            }
             if let Some(reasoning) = chat_delta_reasoning_text(delta) {
                 events.extend(self.push_reasoning_delta(&reasoning));
                 self.append_reasoning_to_active_tools(&reasoning);
@@ -661,6 +668,9 @@ impl ChatToResponsesState {
             if let (Some(extra), Some(obj)) = (&state.extra_content, item.as_object_mut()) {
                 obj.insert("extra_content".to_string(), extra.clone());
             }
+            if let Some(signature) = &self.thinking_signature {
+                item["thinking_signature"] = json!(signature);
+            }
             state.done = true;
             self.output_items.push((output_index, item.clone()));
 
@@ -1076,6 +1086,48 @@ mod tests {
             completed["response"]["output"][0]["extra_content"]["google"]["thought_signature"],
             "sig-abc"
         );
+    }
+
+    #[test]
+    fn preserves_aigw_signature_before_or_after_parallel_tool_deltas() {
+        for signature_first in [false, true] {
+            let mut state = ChatToResponsesState::default();
+            let signature = json!({"id": "chatcmpl_aigw", "model": "gemini-4-argon",
+                "choices": [{"delta": {"thinking_signature": "opaque-signature"}}]});
+            let calls = json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "exec_command", "arguments": "{}"}},
+                {"index": 1, "id": "call_2", "function": {"name": "exec_command", "arguments": "{}"}}
+            ]}}]});
+            for chunk in if signature_first {
+                [&signature, &calls]
+            } else {
+                [&calls, &signature]
+            } {
+                state.handle_chat_chunk(chunk);
+            }
+            state.handle_chat_chunk(&json!({"choices": [{"delta": {"thinking_signature": ""}, "finish_reason": "stop"}]}));
+            let events = parse_sse_events(&String::from_utf8(state.finalize().concat()).unwrap());
+            let done: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "response.output_item.done")
+                .collect();
+            assert_eq!(done.len(), 2);
+            for event in done {
+                assert_eq!(event["item"]["thinking_signature"], "opaque-signature");
+            }
+            let completed = events
+                .iter()
+                .find(|event| event["type"] == "response.completed")
+                .unwrap();
+            assert_eq!(
+                completed["response"]["output"][0]["thinking_signature"],
+                "opaque-signature"
+            );
+            assert_eq!(
+                completed["response"]["output"][1]["thinking_signature"],
+                "opaque-signature"
+            );
+        }
     }
 
     #[tokio::test]
